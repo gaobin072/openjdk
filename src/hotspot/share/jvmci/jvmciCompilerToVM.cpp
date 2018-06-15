@@ -22,8 +22,10 @@
  */
 
 #include "precompiled.hpp"
+#include "ci/ciUtilities.inline.hpp"
 #include "classfile/javaClasses.inline.hpp"
 #include "code/scopeDesc.hpp"
+#include "interpreter/linkResolver.hpp"
 #include "memory/oopFactory.hpp"
 #include "oops/cpCache.inline.hpp"
 #include "oops/generateOopMap.hpp"
@@ -35,6 +37,9 @@
 #include "jvmci/jvmciCompilerToVM.hpp"
 #include "jvmci/jvmciCodeInstaller.hpp"
 #include "jvmci/jvmciRuntime.hpp"
+#include "runtime/flags/jvmFlag.hpp"
+#include "runtime/frame.inline.hpp"
+#include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/jniHandles.inline.hpp"
 #include "runtime/timerTrace.hpp"
 #include "runtime/vframe_hp.hpp"
@@ -98,6 +103,12 @@ oop CompilerToVM::get_jvmci_type(Klass* klass, TRAPS) {
   return NULL;
 }
 
+Handle JavaArgumentUnboxer::next_arg(BasicType expectedType) {
+  assert(_index < _args->length(), "out of bounds");
+  oop arg=((objArrayOop) (_args))->obj_at(_index++);
+  assert(expectedType == T_OBJECT || java_lang_boxing_object::is_instance(arg, expectedType), "arg type mismatch");
+  return Handle(Thread::current(), arg);
+}
 
 jobjectArray readConfiguration0(JNIEnv *env, TRAPS);
 
@@ -115,7 +126,7 @@ C2V_VMENTRY(jobject, getFlagValue, (JNIEnv *, jobject c2vm, jobject name_handle)
   }
   ResourceMark rm;
   const char* cstring = java_lang_String::as_utf8_string(name());
-  Flag* flag = Flag::find_flag(cstring, strlen(cstring), /* allow_locked */ true, /* return_flag */ true);
+  JVMFlag* flag = JVMFlag::find_flag(cstring, strlen(cstring), /* allow_locked */ true, /* return_flag */ true);
   if (flag == NULL) {
     return c2vm;
   }
@@ -472,6 +483,9 @@ C2V_END
 C2V_VMENTRY(jobject, resolveTypeInPool, (JNIEnv*, jobject, jobject jvmci_constant_pool, jint index))
   constantPoolHandle cp = CompilerToVM::asConstantPool(jvmci_constant_pool);
   Klass* resolved_klass = cp->klass_at(index, CHECK_NULL);
+  if (resolved_klass->is_instance_klass()) {
+    InstanceKlass::cast(resolved_klass)->link_class_or_fail(THREAD);
+  }
   oop klass = CompilerToVM::get_jvmci_type(resolved_klass, CHECK_NULL);
   return JNIHandles::make_local(THREAD, klass);
 C2V_END

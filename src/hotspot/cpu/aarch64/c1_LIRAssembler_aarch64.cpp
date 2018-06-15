@@ -24,6 +24,7 @@
  */
 
 #include "precompiled.hpp"
+#include "asm/macroAssembler.inline.hpp"
 #include "asm/assembler.hpp"
 #include "c1/c1_CodeStubs.hpp"
 #include "c1/c1_Compilation.hpp"
@@ -34,10 +35,11 @@
 #include "ci/ciArrayKlass.hpp"
 #include "ci/ciInstance.hpp"
 #include "gc/shared/barrierSet.hpp"
-#include "gc/shared/cardTableModRefBS.hpp"
+#include "gc/shared/cardTableBarrierSet.hpp"
 #include "gc/shared/collectedHeap.hpp"
 #include "nativeInst_aarch64.hpp"
 #include "oops/objArrayKlass.hpp"
+#include "runtime/frame.inline.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "vmreg_aarch64.inline.hpp"
 
@@ -1557,7 +1559,16 @@ void LIR_Assembler::casl(Register addr, Register newval, Register cmpval) {
 
 void LIR_Assembler::emit_compare_and_swap(LIR_OpCompareAndSwap* op) {
   assert(VM_Version::supports_cx8(), "wrong machine");
-  Register addr = as_reg(op->addr());
+  Register addr;
+  if (op->addr()->is_register()) {
+    addr = as_reg(op->addr());
+  } else {
+    assert(op->addr()->is_address(), "what else?");
+    LIR_Address* addr_ptr = op->addr()->as_address_ptr();
+    assert(addr_ptr->disp() == 0, "need 0 disp");
+    assert(addr_ptr->index() == LIR_OprDesc::illegalOpr(), "need 0 index");
+    addr = as_reg(addr_ptr->base());
+  }
   Register newval = as_reg(op->new_value());
   Register cmpval = as_reg(op->cmp_value());
   Label succeed, fail, around;
@@ -1869,7 +1880,7 @@ void LIR_Assembler::comp_op(LIR_Condition condition, LIR_Opr opr1, LIR_Opr opr2,
       // cpu register - cpu register
       Register reg2 = opr2->as_register();
       if (opr1->type() == T_OBJECT || opr1->type() == T_ARRAY) {
-        __ cmp(reg1, reg2);
+        __ cmpoop(reg1, reg2);
       } else {
         assert(opr2->type() != T_OBJECT && opr2->type() != T_ARRAY, "cmp int, oop?");
         __ cmpw(reg1, reg2);
@@ -1900,8 +1911,9 @@ void LIR_Assembler::comp_op(LIR_Condition condition, LIR_Opr opr1, LIR_Opr opr2,
         break;
       case T_OBJECT:
       case T_ARRAY:
-        imm = jlong(opr2->as_constant_ptr()->as_jobject());
-        break;
+        jobject2reg(opr2->as_constant_ptr()->as_jobject(), rscratch1);
+        __ cmpoop(reg1, rscratch1);
+        return;
       default:
         ShouldNotReachHere();
         imm = 0;  // unreachable
@@ -2174,8 +2186,8 @@ void LIR_Assembler::emit_arraycopy(LIR_OpArrayCopy* op) {
     __ stp(length,  src_pos, Address(sp, 2*BytesPerWord));
     __ str(src,              Address(sp, 4*BytesPerWord));
 
-    address C_entry = CAST_FROM_FN_PTR(address, Runtime1::arraycopy);
     address copyfunc_addr = StubRoutines::generic_arraycopy();
+    assert(copyfunc_addr != NULL, "generic arraycopy stub required");
 
     // The arguments are in java calling convention so we shift them
     // to C convention
@@ -2188,17 +2200,12 @@ void LIR_Assembler::emit_arraycopy(LIR_OpArrayCopy* op) {
     assert_different_registers(c_rarg3, j_rarg4);
     __ mov(c_rarg3, j_rarg3);
     __ mov(c_rarg4, j_rarg4);
-    if (copyfunc_addr == NULL) { // Use C version if stub was not generated
-      __ mov(rscratch1, RuntimeAddress(C_entry));
-      __ blrt(rscratch1, 5, 0, 1);
-    } else {
 #ifndef PRODUCT
-      if (PrintC1Statistics) {
-        __ incrementw(ExternalAddress((address)&Runtime1::_generic_arraycopystub_cnt));
-      }
-#endif
-      __ far_call(RuntimeAddress(copyfunc_addr));
+    if (PrintC1Statistics) {
+      __ incrementw(ExternalAddress((address)&Runtime1::_generic_arraycopystub_cnt));
     }
+#endif
+    __ far_call(RuntimeAddress(copyfunc_addr));
 
     __ cbz(r0, *stub->continuation());
 
@@ -2208,14 +2215,12 @@ void LIR_Assembler::emit_arraycopy(LIR_OpArrayCopy* op) {
     __ ldp(length,  src_pos, Address(sp, 2*BytesPerWord));
     __ ldr(src,              Address(sp, 4*BytesPerWord));
 
-    if (copyfunc_addr != NULL) {
-      // r0 is -1^K where K == partial copied count
-      __ eonw(rscratch1, r0, 0);
-      // adjust length down and src/end pos up by partial copied count
-      __ subw(length, length, rscratch1);
-      __ addw(src_pos, src_pos, rscratch1);
-      __ addw(dst_pos, dst_pos, rscratch1);
-    }
+    // r0 is -1^K where K == partial copied count
+    __ eonw(rscratch1, r0, 0);
+    // adjust length down and src/end pos up by partial copied count
+    __ subw(length, length, rscratch1);
+    __ addw(src_pos, src_pos, rscratch1);
+    __ addw(dst_pos, dst_pos, rscratch1);
     __ b(*stub->entry());
 
     __ bind(*stub->continuation());
@@ -2804,7 +2809,8 @@ void LIR_Assembler::negate(LIR_Opr left, LIR_Opr dest) {
 }
 
 
-void LIR_Assembler::leal(LIR_Opr addr, LIR_Opr dest) {
+void LIR_Assembler::leal(LIR_Opr addr, LIR_Opr dest, LIR_PatchCode patch_code, CodeEmitInfo* info) {
+  assert(patch_code == lir_patch_none, "Patch code not supported");
   __ lea(dest->as_register_lo(), as_Address(addr->as_address_ptr()));
 }
 

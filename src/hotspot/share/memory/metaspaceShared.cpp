@@ -29,25 +29,21 @@
 #include "classfile/dictionary.hpp"
 #include "classfile/loaderConstraints.hpp"
 #include "classfile/placeholders.hpp"
-#include "classfile/sharedClassUtil.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/stringTable.hpp"
 #include "classfile/systemDictionary.hpp"
 #include "classfile/systemDictionaryShared.hpp"
 #include "code/codeCache.hpp"
-#if INCLUDE_ALL_GCS
-#include "gc/g1/g1Allocator.inline.hpp"
-#include "gc/g1/g1CollectedHeap.hpp"
-#endif
-#include "gc/shared/gcLocker.hpp"
 #include "interpreter/bytecodeStream.hpp"
 #include "interpreter/bytecodes.hpp"
 #include "logging/log.hpp"
 #include "logging/logMessage.hpp"
 #include "memory/filemap.hpp"
 #include "memory/metaspace.hpp"
+#include "memory/metaspaceClosure.hpp"
 #include "memory/metaspaceShared.hpp"
 #include "memory/resourceArea.hpp"
+#include "oops/compressedOops.inline.hpp"
 #include "oops/instanceClassLoaderKlass.hpp"
 #include "oops/instanceMirrorKlass.hpp"
 #include "oops/instanceRefKlass.hpp"
@@ -56,15 +52,20 @@
 #include "oops/oop.inline.hpp"
 #include "oops/typeArrayKlass.hpp"
 #include "prims/jvmtiRedefineClasses.hpp"
-#include "runtime/timerTrace.hpp"
+#include "runtime/handles.inline.hpp"
 #include "runtime/os.hpp"
+#include "runtime/safepointVerifiers.hpp"
 #include "runtime/signature.hpp"
+#include "runtime/timerTrace.hpp"
 #include "runtime/vmThread.hpp"
 #include "runtime/vm_operations.hpp"
 #include "utilities/align.hpp"
 #include "utilities/defaultStream.hpp"
 #include "utilities/hashtable.inline.hpp"
-#include "memory/metaspaceClosure.hpp"
+#if INCLUDE_G1GC
+#include "gc/g1/g1Allocator.inline.hpp"
+#include "gc/g1/g1CollectedHeap.hpp"
+#endif
 
 ReservedSpace MetaspaceShared::_shared_rs;
 VirtualSpace MetaspaceShared::_shared_vs;
@@ -233,6 +234,7 @@ void MetaspaceShared::initialize_runtime_shared_and_meta_spaces() {
       // with the archived ones, so it must be done after all encodings are determined.
       mapinfo->map_heap_regions();
     }
+    Universe::set_narrow_klass_range(CompressedClassSpaceSize);
 #endif // _LP64
   } else {
     assert(!mapinfo->is_open() && !UseSharedSpaces,
@@ -298,6 +300,8 @@ void MetaspaceShared::initialize_dumptime_shared_and_meta_spaces() {
   // Set narrow_klass_shift to be LogKlassAlignmentInBytes. This is consistent
   // with AOT.
   Universe::set_narrow_klass_shift(LogKlassAlignmentInBytes);
+  // Set the range of klass addresses to 4GB.
+  Universe::set_narrow_klass_range(cds_total);
 
   Metaspace::initialize_class_space(tmp_class_space);
   tty->print_cr("narrow_klass_base = " PTR_FORMAT ", narrow_klass_shift = %d",
@@ -316,6 +320,46 @@ void MetaspaceShared::initialize_dumptime_shared_and_meta_spaces() {
   _mc_region.init(&_shared_rs);
   tty->print_cr("Allocated shared space: " SIZE_FORMAT " bytes at " PTR_FORMAT,
                 _shared_rs.size(), p2i(_shared_rs.base()));
+}
+
+// Called by universe_post_init()
+void MetaspaceShared::post_initialize(TRAPS) {
+  if (UseSharedSpaces) {
+    int size = FileMapInfo::get_number_of_shared_paths();
+    if (size > 0) {
+      SystemDictionaryShared::allocate_shared_data_arrays(size, THREAD);
+      FileMapInfo::FileMapHeader* header = FileMapInfo::current_info()->header();
+      ClassLoaderExt::init_paths_start_index(header->_app_class_paths_start_index);
+      ClassLoaderExt::init_app_module_paths_start_index(header->_app_module_paths_start_index);
+    }
+  }
+
+  if (DumpSharedSpaces) {
+    if (SharedArchiveConfigFile) {
+      read_extra_data(SharedArchiveConfigFile, THREAD);
+    }
+  }
+}
+
+void MetaspaceShared::read_extra_data(const char* filename, TRAPS) {
+  HashtableTextDump reader(filename);
+  reader.check_version("VERSION: 1.0");
+
+  while (reader.remain() > 0) {
+    int utf8_length;
+    int prefix_type = reader.scan_prefix(&utf8_length);
+    ResourceMark rm(THREAD);
+    char* utf8_buffer = NEW_RESOURCE_ARRAY(char, utf8_length);
+    reader.get_utf8(utf8_buffer, utf8_length);
+
+    if (prefix_type == HashtableTextDump::SymbolPrefix) {
+      SymbolTable::new_symbol(utf8_buffer, utf8_length, THREAD);
+    } else{
+      assert(prefix_type == HashtableTextDump::StringPrefix, "Sanity");
+      utf8_buffer[utf8_length] = '\0';
+      oop s = StringTable::intern(utf8_buffer, THREAD);
+    }
+  }
 }
 
 void MetaspaceShared::commit_shared_space_to(char* newtop) {
@@ -449,11 +493,6 @@ static void collect_array_classes(Klass* k) {
 
 class CollectClassesClosure : public KlassClosure {
   void do_klass(Klass* k) {
-    if (!UseAppCDS && !k->class_loader_data()->is_the_null_class_loader_data()) {
-      // AppCDS is not enabled. Let's omit non-boot classes.
-      return;
-    }
-
     if (!(k->is_instance_klass() && InstanceKlass::cast(k)->is_in_error_state())) {
       if (k->is_instance_klass() && InstanceKlass::cast(k)->signers() != NULL) {
         // Mark any class with signers and don't add to the _global_klass_objects
@@ -840,7 +879,7 @@ public:
       assert(MetaspaceShared::is_heap_object_archiving_allowed(),
              "Archiving heap object is not allowed");
       _dump_region->append_intptr_t(
-        (intptr_t)oopDesc::encode_heap_oop_not_null(*o));
+        (intptr_t)CompressedOops::encode_not_null(*o));
     }
   }
 
@@ -1322,6 +1361,8 @@ char* VM_PopulateDumpSharedSpace::dump_read_only_tables() {
 void VM_PopulateDumpSharedSpace::doit() {
   Thread* THREAD = VMThread::vm_thread();
 
+  FileMapInfo::check_nonempty_dir_in_shared_path_table();
+
   NOT_PRODUCT(SystemDictionary::verify();)
   // The following guarantee is meant to ensure that no loader constraints
   // exist yet, since the constraints table is not shared.  This becomes
@@ -1369,6 +1410,9 @@ void VM_PopulateDumpSharedSpace::doit() {
 
   // Move classes from platform/system dictionaries into the boot dictionary
   SystemDictionary::combine_shared_dictionaries();
+
+  // Make sure all classes have a correct loader type.
+  ClassLoaderData::the_null_class_loader_data()->dictionary()->classes_do(MetaspaceShared::check_shared_class_loader_type);
 
   // Remove all references outside the metadata
   tty->print("Removing unshareable information ... ");
@@ -1569,13 +1613,14 @@ class CheckSharedClassesClosure : public KlassClosure {
   }
 };
 
-void MetaspaceShared::check_shared_class_loader_type(Klass* k) {
-  if (k->is_instance_klass()) {
-    InstanceKlass* ik = InstanceKlass::cast(k);
-    u2 loader_type = ik->loader_type();
-    ResourceMark rm;
-    guarantee(loader_type != 0,
-              "Class loader type is not set for this class %s", ik->name()->as_C_string());
+void MetaspaceShared::check_shared_class_loader_type(InstanceKlass* ik) {
+  ResourceMark rm;
+  if (ik->shared_classpath_index() == UNREGISTERED_INDEX) {
+    guarantee(ik->loader_type() == 0,
+            "Class loader type must not be set for this class %s", ik->name()->as_C_string());
+  } else {
+    guarantee(ik->loader_type() != 0,
+            "Class loader type must be set for this class %s", ik->name()->as_C_string());
   }
 }
 
@@ -1614,7 +1659,6 @@ void MetaspaceShared::link_and_cleanup_shared_classes(TRAPS) {
 void MetaspaceShared::prepare_for_dumping() {
   Arguments::check_unsupported_dumping_properties();
   ClassLoader::initialize_shared_path();
-  FileMapInfo::allocate_classpath_entry_table();
 }
 
 // Preload classes from a list, populate the shared spaces and dump to a
@@ -1727,11 +1771,11 @@ bool MetaspaceShared::try_link_class(InstanceKlass* ik, TRAPS) {
   assert(DumpSharedSpaces, "should only be called during dumping");
   if (ik->init_state() < InstanceKlass::linked) {
     bool saved = BytecodeVerificationLocal;
-    if (!(ik->is_shared_boot_class())) {
+    if (ik->loader_type() == 0 && ik->class_loader() == NULL) {
       // The verification decision is based on BytecodeVerificationRemote
       // for non-system classes. Since we are using the NULL classloader
-      // to load non-system classes during dumping, we need to temporarily
-      // change BytecodeVerificationLocal to be the same as
+      // to load non-system classes for customized class loaders during dumping,
+      // we need to temporarily change BytecodeVerificationLocal to be the same as
       // BytecodeVerificationRemote. Note this can cause the parent system
       // classes also being verified. The extra overhead is acceptable during
       // dumping.
@@ -1797,7 +1841,7 @@ void MetaspaceShared::dump_closed_archive_heap_objects(
   G1CollectedHeap::heap()->begin_archive_alloc_range();
 
   // Archive interned string objects
-  StringTable::write_to_archive(closed_archive);
+  StringTable::write_to_archive();
 
   G1CollectedHeap::heap()->end_archive_alloc_range(closed_archive,
                                                    os::vm_allocation_granularity());
@@ -1818,6 +1862,13 @@ void MetaspaceShared::dump_open_archive_heap_objects(
 
   G1CollectedHeap::heap()->end_archive_alloc_range(open_archive,
                                                    os::vm_allocation_granularity());
+}
+
+unsigned MetaspaceShared::obj_hash(oop const& p) {
+  assert(!p->mark()->has_bias_pattern(),
+         "this object should never have been locked");  // so identity_hash won't safepoin
+  unsigned hash = (unsigned)p->identity_hash();
+  return hash;
 }
 
 MetaspaceShared::ArchivedObjectCache* MetaspaceShared::_archive_object_cache = NULL;
@@ -1859,6 +1910,11 @@ oop MetaspaceShared::archive_heap_object(oop obj, Thread* THREAD) {
   return archived_oop;
 }
 
+oop MetaspaceShared::materialize_archived_object(oop obj) {
+  assert(obj != NULL, "sanity");
+  return G1CollectedHeap::heap()->materialize_archived_object(obj);
+}
+
 void MetaspaceShared::archive_klass_objects(Thread* THREAD) {
   int i;
   for (i = 0; i < _global_klass_objects->length(); i++) {
@@ -1873,6 +1929,10 @@ void MetaspaceShared::archive_klass_objects(Thread* THREAD) {
       ik->constants()->archive_resolved_references(THREAD);
     }
   }
+}
+
+bool MetaspaceShared::is_archive_object(oop p) {
+  return (p == NULL) ? false : G1ArchiveAllocator::is_archive_object(p);
 }
 
 void MetaspaceShared::fixup_mapped_heap_regions() {
@@ -1925,7 +1985,7 @@ public:
              "Archived heap object is not allowed");
       assert(MetaspaceShared::open_archive_heap_region_mapped(),
              "Open archive heap region is not mapped");
-      RootAccess<IN_ARCHIVE_ROOT>::oop_store(p, oopDesc::decode_heap_oop_not_null(o));
+      *p = CompressedOops::decode_not_null(o);
     }
   }
 
@@ -1989,7 +2049,7 @@ bool MetaspaceShared::map_shared_spaces(FileMapInfo* mapinfo) {
       (md_base = mapinfo->map_region(md, &md_top)) != NULL &&
       (od_base = mapinfo->map_region(od, &od_top)) != NULL &&
       (image_alignment == (size_t)os::vm_allocation_granularity()) &&
-      mapinfo->validate_classpath_entry_table()) {
+      mapinfo->validate_shared_path_table()) {
     // Success -- set up MetaspaceObj::_shared_metaspace_{base,top} for
     // fast checking in MetaspaceShared::is_in_shared_metaspace() and
     // MetaspaceObj::is_shared().

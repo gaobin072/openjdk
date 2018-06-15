@@ -28,15 +28,15 @@
 #include "memory/allocation.hpp"
 #include "memory/memRegion.hpp"
 #include "memory/metaspace.hpp"
-#include "memory/metaspaceCounters.hpp"
 #include "oops/oopHandle.hpp"
+#include "oops/weakHandle.hpp"
 #include "runtime/mutex.hpp"
-#include "trace/traceMacros.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
-#if INCLUDE_TRACE
-#include "utilities/ticks.hpp"
+#if INCLUDE_JFR
+#include "jfr/support/jfrTraceIdExtension.hpp"
 #endif
+
 
 //
 // A class loader represents a linkset. Conceptually, a linkset identifies
@@ -83,8 +83,8 @@ class ClassLoaderDataGraph : public AllStatic {
   static volatile size_t  _num_instance_classes;
   static volatile size_t  _num_array_classes;
 
+  static ClassLoaderData* add_to_graph(Handle class_loader, bool anonymous);
   static ClassLoaderData* add(Handle class_loader, bool anonymous);
-  static void post_class_unload_events();
  public:
   static ClassLoaderData* find_or_create(Handle class_loader);
   static void purge();
@@ -113,7 +113,7 @@ class ClassLoaderDataGraph : public AllStatic {
   static void packages_unloading_do(void f(PackageEntry*));
   static void loaded_classes_do(KlassClosure* klass_closure);
   static void classes_unloading_do(void f(Klass* const));
-  static bool do_unloading(BoolObjectClosure* is_alive, bool clean_previous_versions);
+  static bool do_unloading(bool clean_previous_versions);
 
   // dictionary do
   // Iterate over all klasses in dictionary, but
@@ -155,8 +155,6 @@ class ClassLoaderDataGraph : public AllStatic {
   static void print() { print_on(tty); }
   static void verify();
 
-  static bool unload_list_contains(const void* x);
-
   // instance and array class counters
   static inline size_t num_instance_classes();
   static inline size_t num_array_classes();
@@ -167,12 +165,6 @@ class ClassLoaderDataGraph : public AllStatic {
 
 #ifndef PRODUCT
   static bool contains_loader_data(ClassLoaderData* loader_data);
-#endif
-
-#if INCLUDE_TRACE
- private:
-  static Ticks _class_unload_time;
-  static void class_unload_event(Klass* const k);
 #endif
 };
 
@@ -221,8 +213,9 @@ class ClassLoaderData : public CHeapObj<mtClass> {
 
   static ClassLoaderData * _the_null_class_loader_data;
 
-  oop _class_loader;          // oop used to uniquely identify a class loader
-                              // class loader or a canonical class path
+  WeakHandle<vm_class_loader_data> _holder; // The oop that determines lifetime of this class loader
+  OopHandle _class_loader;    // The instance of java/lang/ClassLoader associated with
+                              // this ClassLoaderData
 
   ClassLoaderMetaspace * volatile _metaspace;  // Meta-space where meta-data defined by the
                                     // classes in the class loader are allocated.
@@ -234,7 +227,7 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   bool _modified_oops;             // Card Table Equivalent (YC/CMS support)
   bool _accumulated_modified_oops; // Mod Union Equivalent (CMS support)
 
-  s2 _keep_alive;          // if this CLD is kept alive without a keep_alive_object().
+  s2 _keep_alive;          // if this CLD is kept alive.
                            // Used for anonymous classes and the boot class
                            // loader. _keep_alive does not need to be volatile or
                            // atomic since there is one unique CLD per anonymous class.
@@ -265,7 +258,10 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   // Support for walking class loader data objects
   ClassLoaderData* _next; /// Next loader_datas created
 
-  TRACE_DEFINE_TRACE_ID_FIELD;
+  // JFR support
+  Klass*  _class_loader_klass;
+  Symbol* _class_loader_name;
+  JFR_ONLY(DEFINE_TRACE_ID_FIELD;)
 
   void set_next(ClassLoaderData* next) { _next = next; }
   ClassLoaderData* next() const        { return _next; }
@@ -288,6 +284,8 @@ class ClassLoaderData : public CHeapObj<mtClass> {
 
   void unload();
   bool keep_alive() const       { return _keep_alive > 0; }
+
+  oop holder_phantom() const;
   void classes_do(void f(Klass*));
   void loaded_classes_do(KlassClosure* klass_closure);
   void classes_do(void f(InstanceKlass*));
@@ -303,13 +301,15 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   MetaWord* allocate(size_t size);
 
   Dictionary* create_dictionary();
+
+  void initialize_name_and_klass(Handle class_loader);
  public:
   // GC interface.
   void clear_claimed() { _claimed = 0; }
   bool claimed() const { return _claimed == 1; }
   bool claim();
 
-  bool is_alive(BoolObjectClosure* is_alive_closure) const;
+  bool is_alive() const;
 
   // Accessors
   ClassLoaderMetaspace* metaspace_or_null() const { return _metaspace; }
@@ -338,9 +338,7 @@ class ClassLoaderData : public CHeapObj<mtClass> {
 
   // Returns true if this class loader data is for the boot class loader.
   // (Note that the class loader data may be anonymous.)
-  bool is_boot_class_loader_data() const {
-    return class_loader() == NULL;
-  }
+  inline bool is_boot_class_loader_data() const;
 
   bool is_builtin_class_loader_data() const;
   bool is_permanent_class_loader_data() const;
@@ -349,10 +347,7 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   // method will allocate a Metaspace if needed.
   ClassLoaderMetaspace* metaspace_non_null();
 
-  oop class_loader() const      { return _class_loader; }
-
-  // The object the GC is using to keep this ClassLoaderData alive.
-  oop keep_alive_object() const;
+  inline oop class_loader() const;
 
   // Returns true if this class loader data is for a loader going away.
   bool is_unloading() const     {
@@ -361,9 +356,11 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   }
 
   // Used to refcount an anonymous class's CLD in order to
-  // indicate their aliveness without a keep_alive_object().
+  // indicate their aliveness.
   void inc_keep_alive();
   void dec_keep_alive();
+
+  void initialize_holder(Handle holder);
 
   inline unsigned int identity_hash() const { return (unsigned int)(((intptr_t)this) >> 3); }
 
@@ -403,7 +400,17 @@ class ClassLoaderData : public CHeapObj<mtClass> {
   static ClassLoaderData* class_loader_data_or_null(oop loader);
   static ClassLoaderData* anonymous_class_loader_data(Handle loader);
 
-  TRACE_DEFINE_TRACE_ID_METHODS;
+  // Returns Klass* of associated class loader, or NULL if associated loader is <bootstrap>.
+  // Also works if unloading.
+  Klass* class_loader_klass() const { return _class_loader_klass; }
+
+  // Returns Name of associated class loader.
+  // Returns NULL if associated class loader is <bootstrap> or if no name has been set for
+  //   this loader.
+  // Also works if unloading.
+  Symbol* class_loader_name() const { return _class_loader_name; }
+
+  JFR_ONLY(DEFINE_TRACE_ID_METHODS;)
 };
 
 // An iterator that distributes Klasses to parallel worker threads.

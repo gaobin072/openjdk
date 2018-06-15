@@ -164,10 +164,17 @@ public class DeferredAttr extends JCTree.Visitor {
                     JCMemberReference result = new JCMemberReference(t.mode, t.name, expr, typeargs) {
                         @Override
                         public void setOverloadKind(OverloadKind overloadKind) {
-                            super.setOverloadKind(overloadKind);
-                            if (t.getOverloadKind() == null) {
+                            OverloadKind previous = t.getOverloadKind();
+                            if (previous == null) {
                                 t.setOverloadKind(overloadKind);
+                            } else {
+                                Assert.check(previous == overloadKind);
                             }
+                        }
+
+                        @Override
+                        public OverloadKind getOverloadKind() {
+                            return t.getOverloadKind();
                         }
                     };
                     result.pos = t.pos;
@@ -441,7 +448,7 @@ public class DeferredAttr extends JCTree.Visitor {
         } else {
             stats.add((JCBlock)that.body);
         }
-        JCBlock lambdaBlock = make.Block(0, stats.toList());
+        JCBlock lambdaBlock = make.at(that.pos).Block(0, stats.toList());
         Env<AttrContext> localEnv = attr.lambdaEnv(that, env);
         try {
             localEnv.info.returnResult = resultInfo;
@@ -883,8 +890,9 @@ public class DeferredAttr extends JCTree.Visitor {
                 Check.CheckContext checkContext = resultInfo.checkContext;
                 Type pt = resultInfo.pt;
                 if (!inferenceContext.inferencevars.contains(pt)) {
+                    Type descriptor = null;
                     try {
-                        types.findDescriptorType(pt);
+                        descriptor = types.findDescriptorType(pt);
                     } catch (Types.FunctionDescriptorLookupError ex) {
                         checkContext.report(null, ex.getDiagnostic());
                     }
@@ -893,14 +901,14 @@ public class DeferredAttr extends JCTree.Visitor {
                     exprTree = (JCExpression)attribSpeculative(tree.getQualifierExpression(), localEnv,
                             attr.memberReferenceQualifierResult(tree), argumentAttr.withLocalCacheContext());
                     ListBuffer<Type> argtypes = new ListBuffer<>();
-                    for (Type t : types.findDescriptorType(pt).getParameterTypes()) {
+                    for (Type t : descriptor.getParameterTypes()) {
                         argtypes.append(Type.noType);
                     }
                     JCMemberReference mref2 = new TreeCopier<Void>(make).copy(tree);
                     mref2.expr = exprTree;
                     Symbol lookupSym =
                             rs.resolveMemberReference(localEnv, mref2, exprTree.type,
-                                    tree.name, argtypes.toList(), List.nil(), rs.arityMethodCheck,
+                                    tree.name, argtypes.toList(), List.nil(), descriptor, rs.arityMethodCheck,
                                     inferenceContext, rs.structuralReferenceChooser).fst;
                     switch (lookupSym.kind) {
                         case WRONG_MTH:

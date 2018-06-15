@@ -229,8 +229,9 @@ class java_lang_Class : AllStatic {
   static oop  archive_mirror(Klass* k, TRAPS) NOT_CDS_JAVA_HEAP_RETURN_(NULL);
   static oop  process_archived_mirror(Klass* k, oop mirror, oop archived_mirror, Thread *THREAD)
                                       NOT_CDS_JAVA_HEAP_RETURN_(NULL);
-  static void restore_archived_mirror(Klass *k, Handle mirror, Handle class_loader, Handle module,
-                                      Handle protection_domain, TRAPS) NOT_CDS_JAVA_HEAP_RETURN;
+  static bool restore_archived_mirror(Klass *k, Handle class_loader, Handle module,
+                                      Handle protection_domain,
+                                      TRAPS) NOT_CDS_JAVA_HEAP_RETURN_(false);
 
   static void fixup_module_field(Klass* k, Handle module);
 
@@ -921,6 +922,8 @@ class java_lang_ref_Reference: AllStatic {
   static inline void set_discovered(oop ref, oop value);
   static inline void set_discovered_raw(oop ref, oop value);
   static inline HeapWord* discovered_addr_raw(oop ref);
+  static inline oop queue(oop ref);
+  static inline void set_queue(oop ref, oop value);
   static bool is_referent_field(oop obj, ptrdiff_t offset);
   static inline bool is_phantom(oop ref);
 };
@@ -1305,6 +1308,12 @@ class java_lang_ClassLoader : AllStatic {
   // Debugging
   friend class JavaClasses;
   friend class ClassFileParser; // access to number_of_fake_fields
+
+  // Describe ClassLoader for exceptions, tracing ...
+  // Prints "<name>" (instance of <classname>, child of "<name>" <classname>).
+  // If a classloader has no name, it prints <unnamed> instead. The output
+  // for well known loaders (system/platform) is abbreviated.
+  static const char* describe_external(const oop loader);
 };
 
 
@@ -1475,7 +1484,7 @@ class java_util_concurrent_locks_AbstractOwnableSynchronizer : AllStatic {
  private:
   static int  _owner_offset;
  public:
-  static void initialize(TRAPS);
+  static void compute_offsets();
   static oop  get_owner_threadObj(oop obj);
 };
 

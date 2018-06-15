@@ -700,7 +700,8 @@ Java_sun_nio_ch_Net_poll(JNIEnv* env, jclass this, jobject fdo, jint events, jlo
     if (rv >= 0) {
         return pfd.revents;
     } else if (errno == EINTR) {
-        return IOS_INTERRUPTED;
+        // interrupted, no events to return
+        return 0;
     } else {
         handleSocketError(env, errno);
         return IOS_THROWN;
@@ -746,7 +747,7 @@ Java_sun_nio_ch_Net_pollconnValue(JNIEnv *env, jclass this)
 
 /* Declared in nio_util.h */
 
-jint
+JNIEXPORT jint JNICALL
 handleSocketError(JNIEnv *env, jint errorValue)
 {
     char *xn;

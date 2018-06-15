@@ -54,32 +54,32 @@
 #include "classfile/metadataOnStackMark.hpp"
 #include "classfile/moduleEntry.hpp"
 #include "classfile/packageEntry.hpp"
+#include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionary.hpp"
-#include "code/codeCache.hpp"
-#include "gc/shared/gcLocker.hpp"
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
 #include "memory/allocation.inline.hpp"
 #include "memory/metadataFactory.hpp"
 #include "memory/metaspaceShared.hpp"
-#include "memory/oopFactory.hpp"
 #include "memory/resourceArea.hpp"
+#include "memory/universe.hpp"
 #include "oops/access.inline.hpp"
-#include "oops/objArrayOop.inline.hpp"
 #include "oops/oop.inline.hpp"
+#include "oops/oopHandle.inline.hpp"
+#include "oops/weakHandle.inline.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/handles.inline.hpp"
-#include "runtime/javaCalls.hpp"
-#include "runtime/jniHandles.hpp"
 #include "runtime/mutex.hpp"
 #include "runtime/orderAccess.hpp"
 #include "runtime/safepoint.hpp"
-#include "runtime/synchronizer.hpp"
+#include "runtime/safepointVerifiers.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/ostream.hpp"
-#if INCLUDE_TRACE
-#include "trace/tracing.hpp"
+#include "utilities/ticks.hpp"
+#if INCLUDE_JFR
+#include "jfr/jfr.hpp"
+#include "jfr/jfrEvents.hpp"
 #endif
 
 volatile size_t ClassLoaderDataGraph::_num_array_classes = 0;
@@ -105,25 +105,51 @@ void ClassLoaderData::init_null_class_loader_data() {
   }
 }
 
+// JFR and logging support so that the name and klass are available after the
+// class_loader oop is no longer alive, during unloading.
+void ClassLoaderData::initialize_name_and_klass(Handle class_loader) {
+  _class_loader_klass = class_loader->klass();
+  oop class_loader_name = java_lang_ClassLoader::name(class_loader());
+  if (class_loader_name != NULL) {
+    Thread* THREAD = Thread::current();
+    ResourceMark rm(THREAD);
+    const char* class_loader_instance_name =
+      java_lang_String::as_utf8_string(class_loader_name);
+
+    if (class_loader_instance_name != NULL && class_loader_instance_name[0] != '\0') {
+      // Can't throw InternalError and SymbolTable doesn't throw OOM anymore.
+      _class_loader_name = SymbolTable::new_symbol(class_loader_instance_name, CATCH);
+    }
+  }
+}
+
 ClassLoaderData::ClassLoaderData(Handle h_class_loader, bool is_anonymous) :
-  _class_loader(h_class_loader()),
   _is_anonymous(is_anonymous),
   // An anonymous class loader data doesn't have anything to keep
   // it from being unloaded during parsing of the anonymous class.
   // The null-class-loader should always be kept alive.
   _keep_alive((is_anonymous || h_class_loader.is_null()) ? 1 : 0),
   _metaspace(NULL), _unloading(false), _klasses(NULL),
-  _modules(NULL), _packages(NULL),
+  _modules(NULL), _packages(NULL), _unnamed_module(NULL), _dictionary(NULL),
   _claimed(0), _modified_oops(true), _accumulated_modified_oops(false),
   _jmethod_ids(NULL), _handles(), _deallocate_list(NULL),
   _next(NULL),
+  _class_loader_klass(NULL), _class_loader_name(NULL),
   _metaspace_lock(new Mutex(Monitor::leaf+1, "Metaspace allocation lock", true,
                             Monitor::_safepoint_check_never)) {
 
-  // A ClassLoaderData created solely for an anonymous class should never have a
-  // ModuleEntryTable or PackageEntryTable created for it. The defining package
-  // and module for an anonymous class will be found in its host class.
+  if (!h_class_loader.is_null()) {
+    _class_loader = _handles.add(h_class_loader());
+  }
+
   if (!is_anonymous) {
+    // The holder is initialized later for anonymous classes, and before calling anything
+    // that call class_loader().
+    initialize_holder(h_class_loader);
+
+    // A ClassLoaderData created solely for an anonymous class should never have a
+    // ModuleEntryTable or PackageEntryTable created for it. The defining package
+    // and module for an anonymous class will be found in its host class.
     _packages = new PackageEntryTable(PackageEntryTable::_packagetable_entry_size);
     if (h_class_loader.is_null()) {
       // Create unnamed module for boot loader
@@ -133,15 +159,11 @@ ClassLoaderData::ClassLoaderData(Handle h_class_loader, bool is_anonymous) :
       _unnamed_module = ModuleEntry::create_unnamed_module(this);
     }
     _dictionary = create_dictionary();
-  } else {
-    _packages = NULL;
-    _unnamed_module = NULL;
-    _dictionary = NULL;
   }
 
   NOT_PRODUCT(_dependency_count = 0); // number of class loader dependencies
 
-  TRACE_INIT_ID(this);
+  JFR_ONLY(INIT_ID(this);)
 }
 
 ClassLoaderData::ChunkedHandleList::~ChunkedHandleList() {
@@ -201,7 +223,7 @@ class VerifyContainsOopClosure : public OopClosure {
   VerifyContainsOopClosure(oop target) : _target(target), _found(false) {}
 
   void do_oop(oop* p) {
-    if (p != NULL && *p == _target) {
+    if (p != NULL && oopDesc::equals(RawAccess<>::oop_load(p), _target)) {
       _found = true;
     }
   }
@@ -272,7 +294,6 @@ void ClassLoaderData::oops_do(OopClosure* f, bool must_claim, bool clear_mod_oop
     clear_modified_oops();
   }
 
-  f->do_oop(&_class_loader);
   _handles.oops_do(f);
 }
 
@@ -380,7 +401,7 @@ void ClassLoaderData::record_dependency(const Klass* k) {
 
     // Just return if this dependency is to a class with the same or a parent
     // class_loader.
-    if (from == to || java_lang_ClassLoader::isAncestor(from, to)) {
+    if (oopDesc::equals(from, to) || java_lang_ClassLoader::isAncestor(from, to)) {
       return; // this class loader is in the parent list, no need to add it.
     }
   }
@@ -510,6 +531,13 @@ InstanceKlass* ClassLoaderDataGraph::try_get_next_class() {
 }
 
 
+void ClassLoaderData::initialize_holder(Handle loader_or_mirror) {
+  if (loader_or_mirror() != NULL) {
+    assert(_holder.is_null(), "never replace holders");
+    _holder = WeakHandle<vm_class_loader_data>::create(loader_or_mirror);
+  }
+}
+
 // Remove a klass from the _klasses list for scratch_class during redefinition
 // or parsed class in the case of an error.
 void ClassLoaderData::remove_class(Klass* scratch_class) {
@@ -545,14 +573,11 @@ void ClassLoaderData::remove_class(Klass* scratch_class) {
 void ClassLoaderData::unload() {
   _unloading = true;
 
-  // Tell serviceability tools these classes are unloading
-  classes_do(InstanceKlass::notify_unload_class);
-
   LogTarget(Debug, class, loader, data) lt;
   if (lt.is_enabled()) {
     ResourceMark rm;
     LogStream ls(lt);
-    ls.print("unload ");
+    ls.print("unload");
     print_value_on(&ls);
     ls.cr();
   }
@@ -560,6 +585,10 @@ void ClassLoaderData::unload() {
   // Some items on the _deallocate_list need to free their C heap structures
   // if they are not already on the _klasses list.
   unload_deallocate_list();
+
+  // Tell serviceability tools these classes are unloading
+  // after erroneous classes are released.
+  classes_do(InstanceKlass::notify_unload_class);
 
   // Clean up global class iterator for compiler
   static_klass_iterator.adjust_saved_class(this);
@@ -610,16 +639,24 @@ Dictionary* ClassLoaderData::create_dictionary() {
   return new Dictionary(this, size, resizable);
 }
 
-// Unloading support
-oop ClassLoaderData::keep_alive_object() const {
-  assert_locked_or_safepoint(_metaspace_lock);
-  assert(!keep_alive(), "Don't use with CLDs that are artificially kept alive");
-  return is_anonymous() ? _klasses->java_mirror() : class_loader();
+// Tell the GC to keep this klass alive while iterating ClassLoaderDataGraph
+oop ClassLoaderData::holder_phantom() const {
+  // A klass that was previously considered dead can be looked up in the
+  // CLD/SD, and its _java_mirror or _class_loader can be stored in a root
+  // or a reachable object making it alive again. The SATB part of G1 needs
+  // to get notified about this potential resurrection, otherwise the marking
+  // might not find the object.
+  if (!_holder.is_null()) {  // NULL class_loader
+    return _holder.resolve();
+  } else {
+    return NULL;
+  }
 }
 
-bool ClassLoaderData::is_alive(BoolObjectClosure* is_alive_closure) const {
-  bool alive = keep_alive() // null class loader and incomplete anonymous klasses.
-      || is_alive_closure->do_object_b(keep_alive_object());
+// Unloading support
+bool ClassLoaderData::is_alive() const {
+  bool alive = keep_alive()         // null class loader and incomplete anonymous klasses.
+      || (_holder.peek() != NULL);  // and not cleaned by the GC weak handle processing.
 
   return alive;
 }
@@ -652,6 +689,9 @@ ClassLoaderData::~ClassLoaderData() {
 
   ClassLoaderDataGraph::dec_array_classes(cl.array_class_released());
   ClassLoaderDataGraph::dec_instance_classes(cl.instance_class_released());
+
+  // Release the WeakHandle
+  _holder.release();
 
   // Release C heap allocated hashtable for all the packages.
   if (_packages != NULL) {
@@ -872,13 +912,23 @@ ClassLoaderData* ClassLoaderData::anonymous_class_loader_data(Handle loader) {
 }
 
 const char* ClassLoaderData::loader_name() const {
-  // Handles null class loader
-  return SystemDictionary::loader_name(class_loader());
+  if (is_unloading()) {
+    if (_class_loader_klass == NULL) {
+      return "<bootloader>";
+    } else if (_class_loader_name != NULL) {
+      return _class_loader_name->as_C_string();
+    } else {
+      return _class_loader_klass->name()->as_C_string();
+    }
+  } else {
+    // Handles null class loader
+    return SystemDictionary::loader_name(class_loader());
+  }
 }
 
 
 void ClassLoaderData::print_value_on(outputStream* out) const {
-  if (class_loader() != NULL) {
+  if (!is_unloading() && class_loader() != NULL) {
     out->print("loader data: " INTPTR_FORMAT " for instance ", p2i(this));
     class_loader()->print_value_on(out);  // includes loader_name() and address of class loader instance
   } else {
@@ -893,7 +943,7 @@ void ClassLoaderData::print_value_on(outputStream* out) const {
 #ifndef PRODUCT
 void ClassLoaderData::print_on(outputStream* out) const {
   out->print("ClassLoaderData CLD: " PTR_FORMAT ", loader: " PTR_FORMAT ", loader_klass: %s {",
-              p2i(this), p2i((void *)class_loader()), loader_name());
+              p2i(this), p2i(_class_loader.ptr_raw()), loader_name());
   if (is_anonymous()) out->print(" anonymous");
   if (claimed()) out->print(" claimed");
   if (is_unloading()) out->print(" unloading");
@@ -947,13 +997,12 @@ bool ClassLoaderDataGraph::_metaspace_oom = false;
 
 // Add a new class loader data node to the list.  Assign the newly created
 // ClassLoaderData into the java/lang/ClassLoader object as a hidden field
-ClassLoaderData* ClassLoaderDataGraph::add(Handle loader, bool is_anonymous) {
+ClassLoaderData* ClassLoaderDataGraph::add_to_graph(Handle loader, bool is_anonymous) {
   NoSafepointVerifier no_safepoints; // we mustn't GC until we've installed the
                                      // ClassLoaderData in the graph since the CLD
-                                     // contains unhandled oops
+                                     // contains oops in _handles that must be walked.
 
   ClassLoaderData* cld = new ClassLoaderData(loader, is_anonymous);
-
 
   if (!is_anonymous) {
     // First, Atomically set it
@@ -986,6 +1035,16 @@ ClassLoaderData* ClassLoaderDataGraph::add(Handle loader, bool is_anonymous) {
     }
     next = exchanged;
   } while (true);
+}
+
+ClassLoaderData* ClassLoaderDataGraph::add(Handle loader, bool is_anonymous) {
+  ClassLoaderData* loader_data = add_to_graph(loader, is_anonymous);
+  // Initialize name and class after the loader data is added to the CLDG
+  // because adding the Symbol for the name might safepoint.
+  if (loader.not_null()) {
+    loader_data->initialize_name_and_klass(loader);
+  }
+  return loader_data;
 }
 
 void ClassLoaderDataGraph::oops_do(OopClosure* f, bool must_claim) {
@@ -1048,26 +1107,34 @@ void ClassLoaderDataGraph::always_strong_cld_do(CLDClosure* cl) {
 }
 
 void ClassLoaderDataGraph::classes_do(KlassClosure* klass_closure) {
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->classes_do(klass_closure);
   }
 }
 
 void ClassLoaderDataGraph::classes_do(void f(Klass* const)) {
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->classes_do(f);
   }
 }
 
 void ClassLoaderDataGraph::methods_do(void f(Method*)) {
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->methods_do(f);
   }
 }
 
 void ClassLoaderDataGraph::modules_do(void f(ModuleEntry*)) {
   assert_locked_or_safepoint(Module_lock);
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->modules_do(f);
   }
 }
@@ -1084,7 +1151,9 @@ void ClassLoaderDataGraph::modules_unloading_do(void f(ModuleEntry*)) {
 
 void ClassLoaderDataGraph::packages_do(void f(PackageEntry*)) {
   assert_locked_or_safepoint(Module_lock);
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->packages_do(f);
   }
 }
@@ -1100,7 +1169,9 @@ void ClassLoaderDataGraph::packages_unloading_do(void f(PackageEntry*)) {
 }
 
 void ClassLoaderDataGraph::loaded_classes_do(KlassClosure* klass_closure) {
+  Thread* thread = Thread::current();
   for (ClassLoaderData* cld = _head; cld != NULL; cld = cld->next()) {
+    Handle holder(thread, cld->holder_phantom());
     cld->loaded_classes_do(klass_closure);
   }
 }
@@ -1121,21 +1192,27 @@ void ClassLoaderDataGraph::classes_unloading_do(void f(Klass* const)) {
 // Walk classes in the loaded class dictionaries in various forms.
 // Only walks the classes defined in this class loader.
 void ClassLoaderDataGraph::dictionary_classes_do(void f(InstanceKlass*)) {
+  Thread* thread = Thread::current();
   FOR_ALL_DICTIONARY(cld) {
+    Handle holder(thread, cld->holder_phantom());
     cld->dictionary()->classes_do(f);
   }
 }
 
 // Only walks the classes defined in this class loader.
 void ClassLoaderDataGraph::dictionary_classes_do(void f(InstanceKlass*, TRAPS), TRAPS) {
+  Thread* thread = Thread::current();
   FOR_ALL_DICTIONARY(cld) {
+    Handle holder(thread, cld->holder_phantom());
     cld->dictionary()->classes_do(f, CHECK);
   }
 }
 
 // Walks all entries in the dictionary including entries initiated by this class loader.
 void ClassLoaderDataGraph::dictionary_all_entries_do(void f(InstanceKlass*, ClassLoaderData*)) {
+  Thread* thread = Thread::current();
   FOR_ALL_DICTIONARY(cld) {
+    Handle holder(thread, cld->holder_phantom());
     cld->dictionary()->all_entries_do(f);
   }
 }
@@ -1190,17 +1267,6 @@ GrowableArray<ClassLoaderData*>* ClassLoaderDataGraph::new_clds() {
   return array;
 }
 
-bool ClassLoaderDataGraph::unload_list_contains(const void* x) {
-  assert(SafepointSynchronize::is_at_safepoint(), "only safe to call at safepoint");
-  for (ClassLoaderData* cld = _unloading; cld != NULL; cld = cld->next()) {
-    // Needs fixing, see JDK-8199007.
-    if (cld->metaspace_or_null() != NULL && Metaspace::contains(x)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 #ifndef PRODUCT
 bool ClassLoaderDataGraph::contains_loader_data(ClassLoaderData* loader_data) {
   for (ClassLoaderData* data = _head; data != NULL; data = data->next()) {
@@ -1213,15 +1279,38 @@ bool ClassLoaderDataGraph::contains_loader_data(ClassLoaderData* loader_data) {
 }
 #endif // PRODUCT
 
+#if INCLUDE_JFR
+static Ticks class_unload_time;
+static void post_class_unload_event(Klass* const k) {
+  assert(k != NULL, "invariant");
+  EventClassUnload event(UNTIMED);
+  event.set_endtime(class_unload_time);
+  event.set_unloadedClass(k);
+  event.set_definingClassLoader(k->class_loader_data());
+  event.commit();
+}
+
+static void post_class_unload_events() {
+  assert(SafepointSynchronize::is_at_safepoint(), "must be at safepoint!");
+  if (Jfr::is_enabled()) {
+    if (EventClassUnload::is_enabled()) {
+      class_unload_time = Ticks::now();
+      ClassLoaderDataGraph::classes_unloading_do(&post_class_unload_event);
+    }
+    Jfr::on_unloading_classes();
+  }
+}
+#endif // INCLUDE_JFR
 
 // Move class loader data from main list to the unloaded list for unloading
 // and deallocation later.
-bool ClassLoaderDataGraph::do_unloading(BoolObjectClosure* is_alive_closure,
-                                        bool clean_previous_versions) {
+bool ClassLoaderDataGraph::do_unloading(bool clean_previous_versions) {
 
   ClassLoaderData* data = _head;
   ClassLoaderData* prev = NULL;
   bool seen_dead_loader = false;
+  uint loaders_processed = 0;
+  uint loaders_removed = 0;
 
   // Mark metadata seen on the stack only so we can delete unneeded entries.
   // Only walk all metadata, including the expensive code cache walk, for Full GC
@@ -1238,7 +1327,7 @@ bool ClassLoaderDataGraph::do_unloading(BoolObjectClosure* is_alive_closure,
 
   data = _head;
   while (data != NULL) {
-    if (data->is_alive(is_alive_closure)) {
+    if (data->is_alive()) {
       // clean metaspace
       if (walk_all_metadata) {
         data->classes_do(InstanceKlass::purge_previous_versions);
@@ -1246,9 +1335,11 @@ bool ClassLoaderDataGraph::do_unloading(BoolObjectClosure* is_alive_closure,
       data->free_deallocate_list();
       prev = data;
       data = data->next();
+      loaders_processed++;
       continue;
     }
     seen_dead_loader = true;
+    loaders_removed++;
     ClassLoaderData* dead = data;
     dead->unload();
     data = data->next();
@@ -1271,7 +1362,7 @@ bool ClassLoaderDataGraph::do_unloading(BoolObjectClosure* is_alive_closure,
       // Remove entries in the dictionary of live class loader that have
       // initiated loading classes in a dead class loader.
       if (data->dictionary() != NULL) {
-        data->dictionary()->do_unloading(is_alive_closure);
+        data->dictionary()->do_unloading();
       }
       // Walk a ModuleEntry's reads, and a PackageEntry's exports
       // lists to determine if there are modules on those lists that are now
@@ -1287,9 +1378,10 @@ bool ClassLoaderDataGraph::do_unloading(BoolObjectClosure* is_alive_closure,
       }
       data = data->next();
     }
-
-    post_class_unload_events();
+    JFR_ONLY(post_class_unload_events();)
   }
+
+  log_debug(class, loader, data)("do_unloading: loaders processed %u, loaders removed %u", loaders_processed, loaders_removed);
 
   return seen_dead_loader;
 }
@@ -1323,20 +1415,6 @@ int ClassLoaderDataGraph::resize_if_needed() {
     }
   }
   return resized;
-}
-
-void ClassLoaderDataGraph::post_class_unload_events() {
-#if INCLUDE_TRACE
-  assert(SafepointSynchronize::is_at_safepoint(), "must be at safepoint!");
-  if (Tracing::enabled()) {
-    if (Tracing::is_event_enabled(TraceClassUnloadEvent)) {
-      assert(_unloading != NULL, "need class loader data unload list!");
-      _class_unload_time = Ticks::now();
-      classes_unloading_do(&class_unload_event);
-    }
-    Tracing::on_unloading_classes();
-  }
-#endif
 }
 
 ClassLoaderDataGraphKlassIteratorAtomic::ClassLoaderDataGraphKlassIteratorAtomic()
@@ -1422,20 +1500,3 @@ void ClassLoaderDataGraph::print_on(outputStream * const out) {
   }
 }
 #endif // PRODUCT
-
-#if INCLUDE_TRACE
-
-Ticks ClassLoaderDataGraph::_class_unload_time;
-
-void ClassLoaderDataGraph::class_unload_event(Klass* const k) {
-  assert(k != NULL, "invariant");
-
-  // post class unload event
-  EventClassUnload event(UNTIMED);
-  event.set_endtime(_class_unload_time);
-  event.set_unloadedClass(k);
-  event.set_definingClassLoader(k->class_loader_data());
-  event.commit();
-}
-
-#endif // INCLUDE_TRACE

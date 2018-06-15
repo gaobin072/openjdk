@@ -29,7 +29,7 @@
 #include "memory/allocation.hpp"
 #include "memory/memRegion.hpp"
 #include "memory/virtualspace.hpp"
-#include "oops/oop.inline.hpp"
+#include "oops/oop.hpp"
 #include "utilities/exceptions.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/resourceHash.hpp"
@@ -96,12 +96,8 @@ class MetaspaceShared : AllStatic {
   static bool obj_equals(oop const& p1, oop const& p2) {
     return p1 == p2;
   }
-  static unsigned obj_hash(oop const& p) {
-    assert(!p->mark()->has_bias_pattern(),
-           "this object should never have been locked");  // so identity_hash won't safepoin
-    unsigned hash = (unsigned)p->identity_hash();
-    return hash;
-  }
+  static unsigned obj_hash(oop const& p);
+
   typedef ResourceHashtable<oop, oop,
       MetaspaceShared::obj_hash,
       MetaspaceShared::obj_equals,
@@ -115,8 +111,12 @@ class MetaspaceShared : AllStatic {
   }
   static oop find_archived_heap_object(oop obj);
   static oop archive_heap_object(oop obj, Thread* THREAD);
+  static oop materialize_archived_object(oop obj);
   static void archive_klass_objects(Thread* THREAD);
 #endif
+
+  static bool is_archive_object(oop p) NOT_CDS_JAVA_HEAP_RETURN_(false);
+
   static bool is_heap_object_archiving_allowed() {
     CDS_JAVA_HEAP_ONLY(return (UseG1GC && UseCompressedOops && UseCompressedClassPointers);)
     NOT_CDS_JAVA_HEAP(return false;)
@@ -151,6 +151,7 @@ class MetaspaceShared : AllStatic {
   }
   static void initialize_dumptime_shared_and_meta_spaces() NOT_CDS_RETURN;
   static void initialize_runtime_shared_and_meta_spaces() NOT_CDS_RETURN;
+  static void post_initialize(TRAPS) NOT_CDS_RETURN;
 
   // Delta of this object from the bottom of the archive.
   static uintx object_delta(void* obj) {
@@ -225,7 +226,7 @@ class MetaspaceShared : AllStatic {
 
   static bool try_link_class(InstanceKlass* ik, TRAPS);
   static void link_and_cleanup_shared_classes(TRAPS);
-  static void check_shared_class_loader_type(Klass* obj);
+  static void check_shared_class_loader_type(InstanceKlass* ik);
 
   // Allocate a block of memory from the "mc", "ro", or "rw" regions.
   static char* misc_code_space_alloc(size_t num_bytes);
@@ -254,5 +255,8 @@ class MetaspaceShared : AllStatic {
   static void relocate_klass_ptr(oop o);
 
   static Klass* get_relocated_klass(Klass *k);
+
+private:
+  static void read_extra_data(const char* filename, TRAPS) NOT_CDS_RETURN;
 };
 #endif // SHARE_VM_MEMORY_METASPACESHARED_HPP

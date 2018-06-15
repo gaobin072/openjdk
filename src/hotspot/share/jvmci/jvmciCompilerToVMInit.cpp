@@ -23,11 +23,15 @@
 
 // no precompiled headers
 #include "ci/ciUtilities.hpp"
+#include "gc/shared/barrierSet.hpp"
 #include "memory/oopFactory.hpp"
 #include "oops/objArrayOop.inline.hpp"
 #include "jvmci/jvmciRuntime.hpp"
 #include "jvmci/jvmciCompilerToVM.hpp"
 #include "jvmci/vmStructs_jvmci.hpp"
+#include "runtime/flags/jvmFlag.hpp"
+#include "runtime/handles.inline.hpp"
+#include "runtime/sharedRuntime.hpp"
 #include "utilities/resourceHash.hpp"
 
 
@@ -118,8 +122,8 @@ void CompilerToVM::Data::initialize(TRAPS) {
   symbol_init = (address) vmSymbols::object_initializer_name();
   symbol_clinit = (address) vmSymbols::class_initializer_name();
 
-  BarrierSet* bs = Universe::heap()->barrier_set();
-  if (bs->is_a(BarrierSet::CardTableModRef)) {
+  BarrierSet* bs = BarrierSet::barrier_set();
+  if (bs->is_a(BarrierSet::CardTableBarrierSet)) {
     jbyte* base = ci_card_table_address();
     assert(base != NULL, "unexpected byte_map_base");
     cardtable_start_address = base;
@@ -375,9 +379,9 @@ jobjectArray readConfiguration0(JNIEnv *env, TRAPS) {
 #define COUNT_FLAG(ignore) +1
 #ifdef ASSERT
 #define CHECK_FLAG(type, name) { \
-  Flag* flag = Flag::find_flag(#name, strlen(#name), /*allow_locked*/ true, /* return_flag */ true); \
+  JVMFlag* flag = JVMFlag::find_flag(#name, strlen(#name), /*allow_locked*/ true, /* return_flag */ true); \
   assert(flag != NULL, "No such flag named " #name); \
-  assert(flag->is_##type(), "Flag " #name " is not of type " #type); \
+  assert(flag->is_##type(), "JVMFlag " #name " is not of type " #type); \
 }
 #else
 #define CHECK_FLAG(type, name)
@@ -420,4 +424,3 @@ jobjectArray readConfiguration0(JNIEnv *env, TRAPS) {
 #undef ADD_UINTX_FLAG
 #undef CHECK_FLAG
 }
-
